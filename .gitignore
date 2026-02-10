@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MCP auth tokens (sensitive)
+.lens_mcp_token.json
+
+# Logs
+nohup.out
+*.log
+
+# Project-specific generated files
+clown_face_mask.png
+generate_clown_mask.py
+*.mp4
