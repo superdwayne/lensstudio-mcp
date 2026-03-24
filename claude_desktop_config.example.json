@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "lens-studio": {
+      "command": "/Users/dwayne/Documents/Playground/lens-mcp/.venv/bin/python",
+      "args": [
+        "/Users/dwayne/Documents/Playground/lens-mcp/server.py",
+        "--transport", "stdio"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

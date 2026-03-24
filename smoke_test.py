@@ -20,6 +20,8 @@ from threading import Thread
 
 FAKE_PORT = 50099  # Avoid conflicts with real Lens Studio
 FAKE_TOKEN = "test-token-abc123"
+FAKE_SKETCHFAB_PORT = 50098
+FAKE_SKETCHFAB_TOKEN = "sketchfab-test-token"
 
 # Fake tools that mimic what Lens Studio returns
 FAKE_TOOLS = [
@@ -232,6 +234,41 @@ class FakeLensHandler(BaseHTTPRequestHandler):
                             "content": [{"type": "text", "text": f"Results for: {tool_args.get('query', '')}"}]
                         },
                     })
+                elif tool_name == "CreateSceneObjectFromPresetTool":
+                    obj_name = tool_args.get("name", "Unnamed")
+                    preset = tool_args.get("preset", "")
+                    self._respond(200, {
+                        "jsonrpc": "2.0", "id": rid,
+                        "result": {"content": [{"type": "text", "text": json.dumps({"objectUUID": f"fake-uuid-{obj_name}", "name": obj_name, "preset": preset})}]},
+                    })
+                elif tool_name == "SetLensStudioParent":
+                    self._respond(200, {
+                        "jsonrpc": "2.0", "id": rid,
+                        "result": {"content": [{"type": "text", "text": json.dumps({"message": f"Parented {tool_args.get('objectUUID', '')} to {tool_args.get('parentUUID', '')}"})}]},
+                    })
+                elif tool_name == "CreateAssetFromPresetTool":
+                    asset_name = tool_args.get("name", "Unnamed")
+                    self._respond(200, {
+                        "jsonrpc": "2.0", "id": rid,
+                        "result": {"content": [{"type": "text", "text": json.dumps({"assetUUID": f"fake-asset-uuid-{asset_name}", "name": asset_name})}]},
+                    })
+                elif tool_name == "GetLensStudioSceneObjectById":
+                    obj_uuid = tool_args.get("objectUUID", "")
+                    self._respond(200, {
+                        "jsonrpc": "2.0", "id": rid,
+                        "result": {"content": [{"type": "text", "text": json.dumps({"object": {"id": obj_uuid, "name": "FakeObj", "components": [{"type": "RenderMeshVisual", "id": f"comp-{obj_uuid}", "properties": {"id": f"comp-{obj_uuid}"}}]}})}]},
+                    })
+                elif tool_name == "GetLensStudioAssetsByName":
+                    asset_name = tool_args.get("name", "Unknown")
+                    self._respond(200, {
+                        "jsonrpc": "2.0", "id": rid,
+                        "result": {"content": [{"type": "text", "text": json.dumps({"assets": [{"id": f"fake-asset-{asset_name}", "name": asset_name}]})}]},
+                    })
+                elif tool_name in ("SearchLensStudioMusicLibrary", "InstallLicensedMusic"):
+                    self._respond(200, {
+                        "jsonrpc": "2.0", "id": rid,
+                        "result": {"content": [{"type": "text", "text": json.dumps({"results": []})}]},
+                    })
                 else:
                     self._respond(200, {
                         "jsonrpc": "2.0",
@@ -258,6 +295,76 @@ class FakeLensHandler(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------------------
+# Fake Sketchfab API server
+# ---------------------------------------------------------------------------
+
+FAKE_SKETCHFAB_RESULTS = [
+    {
+        "name": "Golden Crown",
+        "uid": "abc123-crown",
+        "thumbnails": {"images": [{"url": "https://example.com/thumb.jpg"}]},
+        "user": {"displayName": "TestUser"},
+        "license": {"slug": "cc-by-4.0"},
+        "vertexCount": 5000,
+        "isDownloadable": True,
+    },
+    {
+        "name": "Silver Crown",
+        "uid": "def456-crown",
+        "thumbnails": {"images": [{"url": "https://example.com/thumb2.jpg"}]},
+        "user": {"displayName": "AnotherUser"},
+        "license": {"slug": "cc-by-sa-4.0"},
+        "vertexCount": 3200,
+        "isDownloadable": True,
+    },
+]
+
+
+class FakeSketchfabHandler(BaseHTTPRequestHandler):
+    """Handles HTTP requests mimicking Sketchfab's Data API v3."""
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        # Fake download endpoint — no auth required (simulates signed URL)
+        if self.path.startswith("/fake-download/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            fake_glb = b"glTF\x02\x00\x00\x00" + b"\x00" * 16
+            self.send_header("Content-Length", str(len(fake_glb)))
+            self.end_headers()
+            self.wfile.write(fake_glb)
+            return
+
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Token ") or auth[6:] != FAKE_SKETCHFAB_TOKEN:
+            self._respond(403, {"detail": "Invalid token"})
+            return
+
+        if self.path.startswith("/v3/search"):
+            self._respond(200, {"results": FAKE_SKETCHFAB_RESULTS})
+        elif "/download" in self.path:
+            # Return a fake download URL pointing back at our server
+            self._respond(200, {
+                "gltf": {
+                    "url": f"http://127.0.0.1:{FAKE_SKETCHFAB_PORT}/fake-download/model.glb",
+                    "size": 1024,
+                }
+            })
+        else:
+            self._respond(404, {"detail": "Not found"})
+
+    def _respond(self, status, body):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        payload = json.dumps(body).encode()
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
@@ -267,15 +374,25 @@ async def run_tests():
     server_thread = Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
+    # Start fake Sketchfab API server
+    sketchfab_server = HTTPServer(("127.0.0.1", FAKE_SKETCHFAB_PORT), FakeSketchfabHandler)
+    sketchfab_thread = Thread(target=sketchfab_server.serve_forever, daemon=True)
+    sketchfab_thread.start()
+
     # Create a temp token file so we don't pollute the real one
     token_file = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, prefix="lens_mcp_token_"
     )
     token_file.close()
 
+    # Create a temp model cache directory
+    model_cache_dir = tempfile.mkdtemp(prefix="lens_mcp_models_")
+
     # Patch environment before importing server module
     os.environ["LENS_MCP_PORT"] = str(FAKE_PORT)
     os.environ["LENS_MCP_TOKEN_FILE"] = token_file.name
+    os.environ["SKETCHFAB_API_TOKEN"] = FAKE_SKETCHFAB_TOKEN
+    os.environ["LENS_MCP_MODEL_CACHE"] = model_cache_dir
 
     # Import server module with fake FastMCP
     import types
@@ -307,6 +424,10 @@ async def run_tests():
     spec = spec_from_loader(loader.name, loader)
     mod = module_from_spec(spec)
     loader.exec_module(mod)
+
+    # Patch Sketchfab config to use fake server
+    mod.SKETCHFAB_BASE_URL = f"http://127.0.0.1:{FAKE_SKETCHFAB_PORT}/v3"
+    mod.sketchfab = mod.SketchfabClient(token=FAKE_SKETCHFAB_TOKEN)
 
     bridge = mod.bridge
     passed = 0
@@ -491,12 +612,423 @@ async def run_tests():
         check("still authenticated", st["authenticated"] is True)
         check("cached tools count", st["cached_tools"] == 7)
 
+        # ============================================================
+        # PHASE 1: Hand Tracking Tests
+        # ============================================================
+        print("\n=== Phase 1: Hand Tracking Tests ===")
+
+        result = mod.get_hand_landmarks()
+        check("hand landmarks returns all", "landmarks" in result)
+        check("hand landmarks count >= 21", len(result.get("landmarks", {})) >= 21)
+
+        result = mod.get_hand_landmarks("thumb_tip")
+        check("hand landmark specific", "thumb_tip" in result)
+
+        result = mod.get_hand_landmarks("index-tip")
+        check("hand landmark dashes normalized", "index_tip" in result)
+
+        result = mod.get_hand_landmarks("nonexistent")
+        check("hand landmark invalid", "error" in result)
+
+        result = await mod.create_hand_anchor()
+        check("create_hand_anchor succeeds", "message" in result)
+        check("hand anchor has uuid", result.get("uuid") is not None)
+
+        result = await mod.add_hand_element("Hand Anchor", "index_tip")
+        check("add_hand_element succeeds", "message" in result)
+        check("hand element position", result.get("position", {}).get("y") == 9)
+
+        result = await mod.add_hand_element("Hand Anchor", "nonexistent_joint")
+        check("add_hand_element invalid landmark", "error" in result)
+
+        result = await mod.add_hand_element("Hand Anchor", "index_tip", shape="hexagon")
+        check("add_hand_element invalid shape", "error" in result)
+
+        result = await mod.create_gesture_trigger("pinch", "print('pinched!')")
+        check("gesture trigger succeeds", "message" in result)
+        check("gesture trigger enum", "HandGesture.Pinch" in result.get("gesture_enum", ""))
+
+        result = await mod.create_gesture_trigger("invalid_gesture", "nope")
+        check("gesture trigger invalid", "error" in result)
+
+        # ============================================================
+        # PHASE 2: Animation System Tests
+        # ============================================================
+        print("\n=== Phase 2: Animation System Tests ===")
+
+        check("easing functions defined", len(mod.EASING_FUNCTIONS) >= 8)
+        check("animatable properties defined", len(mod.ANIMATABLE_PROPERTIES) >= 10)
+
+        result = await mod.create_tween("TestBall", "position_y", 0, 10, 1.0)
+        check("create_tween succeeds", "message" in result)
+
+        result = await mod.create_tween("TestBall", "scale", {"x": 1, "y": 1, "z": 1}, {"x": 2, "y": 2, "z": 2}, 0.5, easing="bounce")
+        check("create_tween with easing", "message" in result)
+
+        result = await mod.create_tween("TestBall", "nonexistent_prop", 0, 1, 1.0)
+        check("create_tween invalid property", "error" in result)
+
+        result = await mod.create_tween("TestBall", "position_y", 0, 1, 1.0, easing="invalid")
+        check("create_tween invalid easing", "error" in result)
+
+        seq = [
+            {"object": "Ball", "property": "position_y", "to": 10, "duration": 1.0},
+            {"object": "Ball", "property": "opacity", "to": 0, "duration": 0.5},
+        ]
+        result = await mod.create_animation_sequence(seq)
+        check("animation sequence succeeds", "message" in result)
+
+        result = await mod.create_animation_sequence([])
+        check("animation sequence empty", "error" in result)
+
+        result = await mod.animate_on_trigger("TestBall", "tap", "position_y", 10)
+        check("animate_on_trigger succeeds", "message" in result)
+
+        result = await mod.animate_on_trigger("TestBall", "nonexistent", "position_y", 10)
+        check("animate_on_trigger invalid trigger", "error" in result)
+
+        result = await mod.create_looping_animation("TestBall", "scale_x", [1, 2], 1.0)
+        check("looping animation succeeds", "message" in result)
+
+        result = await mod.create_looping_animation("TestBall", "scale_x", [1], 1.0)
+        check("looping animation too few values", "error" in result)
+
+        # ============================================================
+        # PHASE 3: Particle System Tests
+        # ============================================================
+        print("\n=== Phase 3: Particle System Tests ===")
+
+        check("particle presets defined", len(mod.PARTICLE_PRESETS) >= 7)
+        check("sparkles preset exists", "sparkles" in mod.PARTICLE_PRESETS)
+
+        result = await mod.create_particle_system("My Sparkles")
+        check("create_particle_system default", "message" in result)
+        check("particle has uuid", "uuid" in result)
+        check("default preset is sparkles", result.get("preset") == "sparkles")
+
+        result = await mod.create_particle_system("My Fire", preset="fire")
+        check("create_particle_system fire", "message" in result)
+
+        result = await mod.create_particle_system("Bad", preset="nonexistent")
+        check("create_particle_system invalid", "error" in result)
+
+        result = await mod.configure_particles("My Sparkles", emission_rate=100, gravity=-2.0)
+        check("configure_particles succeeds", "message" in result)
+
+        result = await mod.configure_particles("My Sparkles")
+        check("configure_particles no props", "error" in result)
+
+        result = await mod.attach_particles("My Sparkles", "TestBall")
+        check("attach_particles succeeds", "message" in result)
+
+        result = await mod.attach_particles("My Sparkles", "TestBall", offset={"x": 0, "y": 1, "z": 0})
+        check("attach_particles with offset", "message" in result)
+
+        result = await mod.create_particle_trail("TestBall", preset="hearts")
+        check("create_particle_trail succeeds", "message" in result)
+
+        result = await mod.create_particle_trail("TestBall", preset="invalid")
+        check("create_particle_trail invalid", "error" in result)
+
+        # ============================================================
+        # PHASE 4: Body & World Tracking Tests
+        # ============================================================
+        print("\n=== Phase 4: Body & World Tracking Tests ===")
+
+        result = mod.get_body_joints()
+        check("body joints returns all", "joints" in result)
+        check("body joints count >= 14", len(result.get("joints", {})) >= 14)
+
+        result = mod.get_body_joints("left_shoulder")
+        check("body joint specific", "left_shoulder" in result)
+
+        result = mod.get_body_joints("nonexistent")
+        check("body joint invalid", "error" in result)
+
+        result = await mod.create_body_anchor()
+        check("create_body_anchor succeeds", "message" in result)
+
+        result = await mod.add_body_element("Body Anchor", "left_shoulder")
+        check("add_body_element succeeds", "message" in result)
+
+        result = await mod.add_body_element("Body Anchor", "nonexistent_joint")
+        check("add_body_element invalid joint", "error" in result)
+
+        result = await mod.create_world_tracker()
+        check("create_world_tracker succeeds", "message" in result)
+
+        result = await mod.create_world_tracker(mode="invalid")
+        check("create_world_tracker invalid mode", "error" in result)
+
+        result = await mod.place_in_world("TestBall", {"x": 0, "y": 1, "z": -5})
+        check("place_in_world succeeds", "message" in result)
+
+        result = await mod.enable_object_tracking("cat")
+        check("enable_object_tracking succeeds", "message" in result)
+
+        result = await mod.enable_object_tracking("invalid")
+        check("enable_object_tracking invalid", "error" in result)
+
+        # ============================================================
+        # PHASE 5: Segmentation & Masking Tests
+        # ============================================================
+        print("\n=== Phase 5: Segmentation & Masking Tests ===")
+
+        result = await mod.create_segmentation_mask("person")
+        check("create_segmentation_mask person", "message" in result)
+
+        result = await mod.create_segmentation_mask("hair")
+        check("create_segmentation_mask hair", "message" in result)
+
+        result = await mod.create_segmentation_mask("invalid")
+        check("create_segmentation_mask invalid", "error" in result)
+
+        result = await mod.apply_background_replacement(color="blue")
+        check("apply_background_replacement succeeds", "message" in result)
+
+        result = await mod.create_person_outline("white", 2.0)
+        check("create_person_outline succeeds", "message" in result)
+
+        result = await mod.apply_hair_color("red")
+        check("apply_hair_color succeeds", "message" in result)
+
+        result = await mod.apply_hair_color("invalid_color_xyz")
+        check("apply_hair_color invalid", "error" in result)
+
+        # ============================================================
+        # PHASE 6: Scripting & Interactivity Tests
+        # ============================================================
+        print("\n=== Phase 6: Scripting & Interactivity Tests ===")
+
+        result = await mod.create_script("MyScript")
+        check("create_script basic", "message" in result)
+
+        result = await mod.create_script("MyScript2", template="state_machine")
+        check("create_script state_machine", "message" in result)
+
+        result = await mod.create_script("MyScript3", template="invalid")
+        check("create_script invalid template", "error" in result)
+
+        result = await mod.create_script("Custom", code="print('hello');")
+        check("create_script custom code", "message" in result)
+
+        result = await mod.attach_script("TestBall", "MyScript")
+        check("attach_script succeeds", "message" in result)
+
+        result = await mod.create_tap_trigger("TestBall", "print('tapped!')")
+        check("create_tap_trigger succeeds", "message" in result)
+
+        result = await mod.create_state_machine(["idle", "active"], {"idle->active": {"trigger": "tap"}}, "idle")
+        check("create_state_machine succeeds", "message" in result)
+
+        result = await mod.create_state_machine(["idle"], {}, "idle")
+        check("create_state_machine too few states", "error" in result)
+
+        result = await mod.create_state_machine(["idle", "active"], {}, "missing")
+        check("create_state_machine invalid initial", "error" in result)
+
+        result = mod.generate_script_from_description("make something happen when I tap")
+        check("generate_script_from_description", "script_code" in result)
+
+        # ============================================================
+        # PHASE 7: Audio & Voice Tests
+        # ============================================================
+        print("\n=== Phase 7: Audio & Voice Tests ===")
+
+        result = await mod.add_audio("TestSound")
+        check("add_audio succeeds", "message" in result)
+
+        result = await mod.play_sound_on_trigger("TestSound", "tap")
+        check("play_sound_on_trigger succeeds", "message" in result)
+
+        result = await mod.play_sound_on_trigger("TestSound", "invalid")
+        check("play_sound_on_trigger invalid trigger", "error" in result)
+
+        result = await mod.apply_voice_effect("pitch_up")
+        check("apply_voice_effect succeeds", "message" in result)
+
+        result = await mod.apply_voice_effect("invalid_effect")
+        check("apply_voice_effect invalid", "error" in result)
+
+        result = await mod.sync_to_music_beat("TestBall", "scale")
+        check("sync_to_music_beat succeeds", "message" in result)
+
+        result = await mod.sync_to_music_beat("TestBall", "invalid_prop")
+        check("sync_to_music_beat invalid prop", "error" in result)
+
+        result = await mod.search_music_library("upbeat dance")
+        check("search_music_library succeeds", "message" in result)
+
+        result = await mod.install_licensed_music("track-123")
+        check("install_licensed_music succeeds", isinstance(result, dict))
+
+        # ============================================================
+        # PHASE 8: Post-Processing Tests
+        # ============================================================
+        print("\n=== Phase 8: Post-Processing Tests ===")
+
+        result = await mod.add_post_effect("bloom", 0.5)
+        check("add_post_effect bloom", "message" in result)
+
+        result = await mod.add_post_effect("invalid_effect")
+        check("add_post_effect invalid", "error" in result)
+
+        result = await mod.apply_color_grading("warm")
+        check("apply_color_grading warm", "message" in result)
+
+        result = await mod.apply_color_grading("invalid")
+        check("apply_color_grading invalid", "error" in result)
+
+        result = await mod.create_custom_lut("My LUT")
+        check("create_custom_lut succeeds", "message" in result)
+
+        result = await mod.add_screen_effect("light_leaks")
+        check("add_screen_effect succeeds", "message" in result)
+
+        result = await mod.add_screen_effect("effect", blend_mode="invalid")
+        check("add_screen_effect invalid blend", "error" in result)
+
+        # ============================================================
+        # PHASE 9: Advanced Materials Tests
+        # ============================================================
+        print("\n=== Phase 9: Advanced Materials Tests ===")
+
+        result = await mod.create_textured_material("TestMat", metallic=0.5, roughness=0.3)
+        check("create_textured_material succeeds", "message" in result)
+
+        result = await mod.create_textured_material("ColorMat", color="gold")
+        check("create_textured_material with color", "message" in result)
+
+        result = await mod.apply_texture("TestBall", "MyTexture")
+        check("apply_texture succeeds", "message" in result)
+
+        result = await mod.create_animated_texture("AnimTex", frame_count=10, fps=24)
+        check("create_animated_texture succeeds", "message" in result)
+
+        result = await mod.create_custom_shader("MyShader", "graph")
+        check("create_custom_shader succeeds", "message" in result)
+
+        result = await mod.create_custom_shader("Bad", "invalid_type")
+        check("create_custom_shader invalid", "error" in result)
+
+        result = await mod.set_material_property("TestMat", "passInfos.0.metallic", 0.8)
+        check("set_material_property succeeds", "message" in result)
+
+        # ============================================================
+        # PHASE 10: Lens Recipes Tests
+        # ============================================================
+        print("\n=== Phase 10: Lens Recipes Tests ===")
+
+        result = mod.list_lens_recipes()
+        check("list_lens_recipes returns recipes", "recipes" in result)
+        check("face_filter recipe exists", "face_filter" in result.get("recipes", {}))
+
+        result = await mod.create_lens_from_recipe("face_filter")
+        check("face_filter recipe succeeds", "message" in result)
+        check("face_filter has components", result.get("components_created", 0) > 0)
+
+        result = await mod.create_lens_from_recipe("hand_sparkles")
+        check("hand_sparkles recipe succeeds", "message" in result)
+
+        result = await mod.create_lens_from_recipe("background_replace", {"color": "green"})
+        check("background_replace recipe succeeds", "message" in result)
+
+        result = await mod.create_lens_from_recipe("world_object")
+        check("world_object recipe succeeds", "message" in result)
+
+        result = await mod.create_lens_from_recipe("beauty_filter")
+        check("beauty_filter recipe succeeds", "message" in result)
+
+        result = await mod.create_lens_from_recipe("invalid_recipe")
+        check("invalid recipe returns error", "error" in result)
+
+        result = await mod.create_face_filter_lens([
+            {"landmark": "nose_tip", "shape": "sphere", "color": "red"},
+            {"landmark": "left_ear_top", "shape": "cone", "color": "pink"},
+        ])
+        check("create_face_filter_lens succeeds", "message" in result)
+
+        result = await mod.create_face_filter_lens([])
+        check("create_face_filter_lens empty", "error" in result)
+
+        result = await mod.create_try_on_lens("glasses")
+        check("create_try_on_lens glasses", "message" in result)
+
+        result = await mod.create_try_on_lens("invalid_type")
+        check("create_try_on_lens invalid", "error" in result)
+
+        result = await mod.create_game_lens("tap_targets")
+        check("create_game_lens succeeds", "message" in result)
+
+        result = await mod.create_game_lens("invalid_type")
+        check("create_game_lens invalid", "error" in result)
+
+        # ============================================================
+        # 3D MODEL LIBRARY (Sketchfab) Tests
+        # ============================================================
+        print("\n=== 3D Model Library (Sketchfab) Tests ===")
+
+        # search_3d_models — successful search
+        result = await mod.search_3d_models("crown")
+        check("search_3d_models returns results", "results" in result)
+        check("search_3d_models message", "Found 2" in result.get("message", ""))
+        results_list = result.get("results", [])
+        check("search_3d_models count", len(results_list) == 2)
+        check("search result has uid", results_list[0].get("uid") == "abc123-crown")
+        check("search result has name", results_list[0].get("name") == "Golden Crown")
+        check("search result has author", results_list[0].get("author") == "TestUser")
+        check("search result has license", results_list[0].get("license") == "cc-by-4.0")
+        check("search result has vertex_count", results_list[0].get("vertex_count") == 5000)
+        check("search result has downloadable", results_list[0].get("downloadable") is True)
+        check("search result has thumbnail", "example.com" in results_list[0].get("thumbnail", ""))
+
+        # search_3d_models — missing API token
+        original_token = mod.SKETCHFAB_API_TOKEN
+        mod.SKETCHFAB_API_TOKEN = ""
+        result = await mod.search_3d_models("crown")
+        check("search without token returns error", "error" in result)
+        check("search error mentions env var", "SKETCHFAB_API_TOKEN" in result.get("error", ""))
+        mod.SKETCHFAB_API_TOKEN = original_token
+
+        # import_3d_model — successful download and import
+        # Mock ui_import_asset to avoid real macOS UI automation
+        _original_ui_import = mod.ui_import_asset
+        async def _mock_ui_import(path):
+            return {"message": f"Imported {path}", "returncode": 0}
+        mod.ui_import_asset = _mock_ui_import
+
+        result = await mod.import_3d_model("abc123-crown", "TestCrown")
+        check("import_3d_model returns message", "message" in result)
+        check("import_3d_model has file_path", "TestCrown.glb" in result.get("file_path", ""))
+        import pathlib
+        check("import_3d_model file exists", pathlib.Path(result["file_path"]).exists())
+        check("import_3d_model has import_result", "import_result" in result)
+
+        mod.ui_import_asset = _original_ui_import
+
+        # import_3d_model — missing UID
+        result = await mod.import_3d_model("")
+        check("import empty uid returns error", "error" in result)
+
+        # import_3d_model — missing API token
+        mod.SKETCHFAB_API_TOKEN = ""
+        result = await mod.import_3d_model("abc123-crown")
+        check("import without token returns error", "error" in result)
+        mod.SKETCHFAB_API_TOKEN = original_token
+
     finally:
         await bridge.close()
+        await mod.sketchfab.close()
         server.shutdown()
-        # Clean up temp file
+        sketchfab_server.shutdown()
+        # Clean up temp files
         try:
             os.unlink(token_file.name)
+        except OSError:
+            pass
+        try:
+            import shutil
+            shutil.rmtree(model_cache_dir, ignore_errors=True)
         except OSError:
             pass
 
